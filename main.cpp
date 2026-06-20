@@ -41,7 +41,7 @@ dloss/dy_pred == dout = y/y_pred - (1-y)/(1-y_pred)
 
 
 
-constexpr double LR = 0.001;
+constexpr double LR = 0.01;
 constexpr double EPS = 1e-12;
 constexpr int OUTPUTSIZE = 1;
 
@@ -321,6 +321,28 @@ class Model {
         return x[0][0];
     }
 
+    void backward_(double dloss) {
+        std::vector<std::vector<double>> grad = {{dloss}};
+        // pred = sigmoid(z), so now grad becomes dL/dz_output
+        grad = sigmoid_.backward(grad);
+
+        // Backward through final linear layer.
+        // There is no ReLU after the final layer.
+        grad = layers_.back().backward(grad);
+
+        // Backward through hidden layers in reverse order.
+        for (std::size_t i = relus_.size(); i-- > 0;) {
+            grad = relus_[i].backward(grad);
+            grad = layers_[i].backward(grad);
+        }
+    }
+
+    void update_() {
+        for (Layer& layer : layers_) {
+            layer.update();
+        }
+    }
+
 public:
 
     Model(const std::vector<int>& layerSizes) {
@@ -330,13 +352,162 @@ public:
     double forward(const std::vector<std::vector<double>>& input) {
         return forward_(input);
     }
+
+    double trainStep(
+        const std::vector<std::vector<double>>& input,
+        double gt
+    ) {
+        double pred = forward_(input);
+
+        double currentLoss = loss_.loss(pred, gt);
+        double dloss = loss_.dout(pred, gt);
+
+        backward_(dloss);
+        update_();
+
+        return currentLoss;
+    }
     
-
-
 };
 
 
-int test() {
+class Dataset {
+    std::vector<
+        std::pair<
+            std::vector<std::vector<double>>,
+            double
+        >
+    > data_;
+
+public:
+    Dataset(int numSamples, int inputSize = 5) {
+        std::mt19937 gen(42);
+        std::uniform_real_distribution<double> dist(0.0, 0.6);
+
+        data_.reserve(numSamples);
+
+        for (int i = 0; i < numSamples; ++i) {
+            std::vector<std::vector<double>> input(
+                inputSize,
+                std::vector<double>(1, 0.0)
+            );
+
+            double sum = 0.0;
+
+            for (int j = 0; j < inputSize; ++j) {
+                input[j][0] = dist(gen);
+                sum += input[j][0];
+            }
+
+            double gt = (sum > 1.5) ? 1.0 : 0.0;
+
+            data_.push_back({input, gt});
+        }
+    }
+
+    std::size_t size() const {
+        return data_.size();
+    }
+
+    std::vector<
+        std::pair<
+            std::vector<std::vector<double>>,
+            double
+        >
+    >::const_iterator begin() const {
+        return data_.begin();
+    }
+
+    std::vector<
+        std::pair<
+            std::vector<std::vector<double>>,
+            double
+        >
+    >::const_iterator end() const {
+        return data_.end();
+    }
+};
+
+
+class Trainer {
+    Model& model_;
+    Dataset dataset_;
+    int numEpochs_ = 20;
+
+    bool checkCorrect(double prob, double gt) {
+        double predClass = (prob >= 0.5) ? 1.0 : 0.0;
+        return predClass == gt;
+    }
+
+    std::pair<double, bool> trainStep(
+        const std::vector<std::vector<double>>& input,
+        double gt
+    ) {
+        double probBeforeUpdate = model_.forward(input);
+        bool correct = checkCorrect(probBeforeUpdate, gt);
+
+        double loss = model_.trainStep(input, gt);
+
+        return {loss, correct};
+    }
+
+    std::pair<double, double> trainEpoch() {
+        int correctCount = 0;
+        double totalLoss = 0.0;
+
+        std::size_t numInstances = dataset_.size();
+
+        for (
+            const std::pair<std::vector<std::vector<double>>, double>& sample
+            : dataset_
+        ) {
+            const std::vector<std::vector<double>>& input = sample.first;
+            double gt = sample.second;
+
+            std::pair<double, bool> result = trainStep(input, gt);
+
+            double loss = result.first;
+            bool correct = result.second;
+
+            totalLoss += loss;
+
+            if (correct) {
+                ++correctCount;
+            }
+        }
+
+        double avgLoss = totalLoss / static_cast<double>(numInstances);
+        double accuracy =
+            static_cast<double>(correctCount) / static_cast<double>(numInstances);
+
+        return {avgLoss, accuracy};
+    }
+
+    void train_() {
+        for (int i = 0; i < numEpochs_; ++i) {
+            std::pair<double, double> result = trainEpoch();
+
+            double avgLoss = result.first;
+            double accuracy = result.second;
+
+            std::cout << "Epoch: " << i + 1
+                      << " Avg. Loss: " << avgLoss
+                      << " Accuracy: " << accuracy << "\n";
+        }
+    }
+
+public:
+    Trainer(Model& model, int numSamples = 1000)
+        : model_{model}, dataset_{numSamples} {}
+
+    void train() {
+        train_();
+    }
+};
+
+
+
+int testForward() {
     try {
         // Model with input size 5, hidden layers 8 and 4, output size 1
         Model model({8, 4});
@@ -381,6 +552,37 @@ int test() {
     return 0;
 }
 
+
+int testTrain() {
+    try {
+        Model model({8, 4});
+
+        Trainer trainer(model, 1000);
+        trainer.train();
+
+        std::vector<std::vector<double>> input = {
+            {0.6},
+            {0.6},
+            {0.6},
+            {0.6},
+            {0.6}
+        };
+
+        double pred = model.forward(input);
+
+        std::cout << "\nFinal test prediction: " << pred << "\n";
+        std::cout << "Expected class: 1\n";
+        std::cout << "Predicted class: " << (pred >= 0.5 ? 1 : 0) << "\n";
+
+    } catch (const std::exception& e) {
+        std::cout << "Exception: " << e.what() << "\n";
+    }
+
+    return 0;
+}
+
+
 int main() {
-    return test();
+    testForward();
+    return testTrain();
 }

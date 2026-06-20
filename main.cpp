@@ -12,6 +12,8 @@ log prob: y * log(y_pred) + (1 - y)*log(1 - y_pred)
 - dloss/db = dloss/dy_pred * dy_pred/dz * dz/db
 - dloss/dx = dloss/dy_pred * dy_pred/dz * dz/dx
 
+dloss/dy_pred == dout
+
 z = Wx + b
 - dz/dW = x
 - dz/db = 1
@@ -21,7 +23,7 @@ y_pred = activation = relu / sigmoid
 - SIGMOID dy_pred/dz = sigmoid(z)(1-sigmoid(z))
 - RELU    dy_pred/dz = o if z < 0 else 1
 
-dloss/dy_pred = y/y_pred - (1-y)/(1-y_pred)
+dloss/dy_pred == dout = y/y_pred - (1-y)/(1-y_pred)
 
 */
 
@@ -34,9 +36,13 @@ dloss/dy_pred = y/y_pred - (1-y)/(1-y_pred)
 #include <string>
 #include <random>
 #include <stdexcept>
-#include <functional>
 #include <cmath>
 #include <algorithm>
+
+
+
+constexpr double LR = 0.001;
+constexpr double eps = 1e-12;
 
 
 std::vector<std::vector<double>> transposeMatrix(const std::vector<std::vector<double>>& input) {
@@ -106,10 +112,12 @@ class ReLU {
     std::vector<std::vector<double>> input_;
 
 public:
-    std::vector<std::vector<double>> forward(const std::vector<std::vector<double>>& x) {
-        input_ = x;
+    std::vector<std::vector<double>> forward(
+        const std::vector<std::vector<double>>& input
+    ) {
+        input_ = input;
 
-        std::vector<std::vector<double>> output = x; /*copy and then max between 0 and value*/
+        std::vector<std::vector<double>> output = input; /*copy and then max between 0 and value*/
         for (std::vector<double>& val : output) {
             val[0] = std::max(val[0], 0.0);
         }
@@ -117,7 +125,9 @@ public:
         return output;
     }
 
-     std::vector<std::vector<double>> backward(const std::vector<std::vector<double>>& gradOutput) {
+    std::vector<std::vector<double>> backward(
+        const std::vector<std::vector<double>>& gradOutput
+    ) {
         std::vector<std::vector<double>> gradInput = gradOutput;
 
         for (int i = 0; i < gradInput.size(); ++i) {
@@ -127,24 +137,66 @@ public:
                 gradInput[i][0] = 0.0;
             }
         }
-
         return gradInput;
     }
 
 };
 
 
+class Sigmoid {
+
+    std::vector<std::vector<double>> output_;
+
+public:
+    std::vector<std::vector<double>> forward(const std::vector<std::vector<double>>& x) {
+        std::vector<std::vector<double>> output = x;
+        for (std::vector<double>& val : output) {
+            val[0] = 1.0 / (1.0 + std::exp(-val[0]));
+        }
+        output_ = output;
+        return output;
+    }
+
+     std::vector<std::vector<double>> backward(const std::vector<std::vector<double>>& gradOutput) {
+        std::vector<std::vector<double>> gradInput = gradOutput;
+        for (int i = 0; i < gradInput.size(); ++i) {
+            gradInput[i][0] *= output_[i][0] * (1.0 - output_[i][0]);
+        } 
+        return gradInput;
+    }
+
+};
+
+
+class BinaryCrossEntropy {
+
+public:
+
+    double loss(double pred, double gt) {
+        // We do not want to have 1.0 or 0.0 otherwise division by infinity
+        pred = std::clamp(pred, eps, 1.0 - eps);
+        return -(gt * std::log(pred) + (1.0 - gt) * std::log(1 - pred));
+    }
+
+    double dout(double pred, double gt) {
+        // We do not want to have 1.0 or 0.0 otherwise division by infinity
+        pred = std::clamp(pred, eps, 1.0 - eps);
+        return -(gt / pred - (1.0 - gt) / (1.0 - pred));
+    }
+};
 
 
 class Layer {
 
     int inputSize_;
     int outputSize_;
-    std::function<std::vector<std::vector<double>>(const std::vector<std::vector<double>>&)> activationFunction_;
-
+    
     std::vector<std::vector<double>> W; /* (output_dim, input_dim) */
     std::vector<std::vector<double>> b; /* (output_dim, 1) */
     std::vector<std::vector<double>> x; /* (input_dim, 1) stored for backtrack */
+
+    std::vector<std::vector<double>> dW; /* (output_dim, input_dim) */
+    std::vector<std::vector<double>> db; /* (output_dim, 1) */
     
     void initializeWandB() {
         /* Assign random values between -0.5 and 0.5 to W matrix and b vector */
@@ -166,32 +218,59 @@ class Layer {
 
 public:
 
-    Layer(int inputSize, int outputSize, std::function<std::vector<std::vector<double>>(const std::vector<std::vector<double>>&)> activationFunction) 
-        : inputSize_{inputSize} , outputSize_{outputSize}, activationFunction_{activationFunction} {
+    Layer(int inputSize, int outputSize) 
+        : inputSize_{inputSize} , outputSize_{outputSize} {
             initializeWandB();
         }
 
 
-    std::vector<std::vector<double>> forward(std::vector<std::vector<double>>& input) {
+    std::vector<std::vector<double>> forward(
+        const std::vector<std::vector<double>>& input
+    ) {
         /*
         z = Wx + b
         a = activation_function(z)
         We have to store the input value for backtrack
         */
-        
-        std::vector<std::vector<double>> a = matMul(W, input); /*(output_dim, 1)*/
-        a = activationFunction_(a); /*(output_dim, 1)*/
-        return a;
+        x = input;
+        std::vector<std::vector<double>> z = matMul(W, input); /*(output_dim, 1)*/
+        for (int i = 0; i < outputSize_; ++i) {
+            z[i][0] += b[i][0];
+        }
+        return z;
     }
 
-    std::vector<std::vector<double>> backward(std::vector<std::vector<double>>& output) {
+    std::vector<std::vector<double>> backward(
+        const std::vector<std::vector<double>>& dz
+    ) {
         /*
         Compute derivatives and store them to update after each step
         Also compute how much input contributes to pass it to the prev layer
         So here we compute dW , db and dx , and we return dx to the prev layer
         */
-        std::vector<std::vector<double>> inputProportion;
-        return inputProportion;
+
+        dW = matMul(dz, transposeMatrix(x));        // (output, 1) * (1, input)
+        db = dz;                                    // (output, 1)
+
+        std::vector<std::vector<double>> dx =
+            matMul(transposeMatrix(W), dz);         // (input, output) * (output, 1)
+
+        return dx;
+        
+    }
+
+    void update() {
+        /*Update W*/
+        for (int i = 0; i < outputSize_; ++i) {
+            for (int j = 0; j < inputSize_; ++j) {
+                W[i][j] -= LR * dW[i][j];
+            }
+        }
+
+        /*Update b*/
+        for (int i = 0; i < outputSize_; ++i) {
+            b[i][0] -= LR * db[i][0];
+        }
     }
 
 };
